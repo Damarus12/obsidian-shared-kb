@@ -251,7 +251,9 @@ class VaultFiles implements LocalFiles {
 	}
 	async remove(p: string): Promise<void> {
 		const f = this.file(p);
-		if (f) await this.app.fileManager.trashFile(f);
+		if (!f) return;
+		await this.app.fileManager.trashFile(f);
+		await this.pruneEmpty(this.local(p));
 	}
 	async rename(from: string, to: string): Promise<void> {
 		const f = this.file(from);
@@ -259,6 +261,19 @@ class VaultFiles implements LocalFiles {
 		await this.ensureFolder(this.local(to));
 		// vault.rename, not fileManager.renameFile: rewriting links in other notes would push edits nobody made.
 		await this.app.vault.rename(f, this.local(to));
+		await this.pruneEmpty(this.local(from));
+	}
+
+	/** After a sync removes or moves a file away, delete folders it left empty (never the sync folder itself). */
+	private async pruneEmpty(filePath: string): Promise<void> {
+		const root = this.folder ? normalizePath(this.folder) : "";
+		let dir = filePath.includes("/") ? filePath.slice(0, filePath.lastIndexOf("/")) : "";
+		while (dir && dir !== root) {
+			const folder = this.app.vault.getAbstractFileByPath(dir);
+			if (!(folder instanceof TFolder) || folder.children.length > 0) return;
+			await this.app.vault.delete(folder);
+			dir = dir.includes("/") ? dir.slice(0, dir.lastIndexOf("/")) : "";
+		}
 	}
 
 	private async ensureFolder(filePath: string): Promise<void> {

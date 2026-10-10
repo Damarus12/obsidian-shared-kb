@@ -1,0 +1,319 @@
+import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, normalizePath, requestUrl } from "obsidian";
+import { HttpApi, type Requester } from "./http-api";
+import { ApiError, emptyState, SyncEngine, type LocalFiles, type SyncState } from "./sync";
+
+interface Settings {
+	/** The member link from the admin, e.g. https://kb.example.workers.dev/kb/abc/token/ */
+	link: string;
+	/** Vault folder that mirrors the knowledge base ("" = whole vault). */
+	folder: string;
+}
+
+interface Data {
+	settings: Settings;
+	state: SyncState;
+	/** The link the state belongs to; a different link starts a fresh sync. */
+	stateLink?: string;
+}
+
+const DEFAULTS: Settings = { link: "", folder: "" };
+
+/** requestUrl skips CORS and works on mobile; errors come back as status codes. */
+const obsidianRequest: Requester = async ({ url, method, body }) => {
+	const res = await requestUrl({ url, method, body, contentType: "application/json", throw: false });
+	let json: unknown = null;
+	try {
+		json = res.json;
+	} catch {
+		// not JSON
+	}
+	return { status: res.status, json };
+};
+const PUSH_DELAY_MS = 1500;
+const POLL_MS = 5 * 60 * 1000;
+
+export default class SharedKbPlugin extends Plugin {
+	data: Data = { settings: { ...DEFAULTS }, state: emptyState() };
+	private engine: SyncEngine | null = null;
+	private socket: WebSocket | null = null;
+	private retry = 0;
+	private retryTimer: number | null = null;
+	private pending = new Map<string, number>();
+	private statusEl: HTMLElement | null = null;
+
+	async onload(): Promise<void> {
+		const saved = (await this.loadData()) as Partial<Data> | null;
+		this.data = {
+			settings: { ...DEFAULTS, ...saved?.settings },
+			state: saved?.state ?? emptyState(),
+			stateLink: saved?.stateLink,
+		};
+		this.statusEl = this.addStatusBarItem();
+		this.addSettingTab(new SettingsTab(this.app, this));
+		this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.syncNow() });
+		this.addCommand({
+			id: "open-in-browser",
+			name: "Open knowledge base in browser",
+			callback: () => this.data.settings.link && window.open(this.base()),
+		});
+		this.app.workspace.onLayoutReady(() => {
+			this.registerVaultEvents();
+			void this.start();
+		});
+		this.registerInterval(window.setInterval(() => this.track(this.engine?.pull()), POLL_MS));
+		this.registerDomEvent(document, "visibilitychange", () => {
+			if (document.visibilityState === "visible") this.track(this.engine?.pull());
+		});
+	}
+
+	onunload(): void {
+		this.stop();
+	}
+
+	/** (Re)connects with the current settings. */
+	async start(): Promise<void> {
+		this.stop();
+		const { link } = this.data.settings;
+		if (!link) return this.status("not set up");
+		if (this.data.stateLink !== link) {
+			this.data.state = emptyState();
+			this.data.stateLink = link;
+		}
+		this.engine = new SyncEngine(new HttpApi(this.base(), obsidianRequest), new VaultFiles(this.app, this.data.settings.folder), this.data.state, () => this.saveData(this.data), {
+			onConflict: (path, copy) => new Notice(`Shared KB: "${path}" changed on the server while you edited it. Your version is in "${copy}".`, 15000),
+			onError: (e) => this.fail(e),
+		});
+		await this.syncNow();
+		this.connect();
+	}
+
+	async syncNow(): Promise<void> {
+		if (!this.engine) return;
+		this.status("syncing…");
+		try {
+			await this.engine.fullSync();
+			this.status("synced");
+		} catch (e) {
+			this.fail(e);
+		}
+	}
+
+	base(): string {
+		return this.data.settings.link.trim().replace(/\/(mcp)?\/?$/, "") + "/";
+	}
+
+	private stop(): void {
+		if (this.retryTimer !== null) window.clearTimeout(this.retryTimer);
+		this.retryTimer = null;
+		this.socket?.close();
+		this.socket = null;
+		for (const t of this.pending.values()) window.clearTimeout(t);
+		this.pending.clear();
+		this.engine = null;
+	}
+
+	/** Live updates: the server sends {type:"changed"} after every write. */
+	private connect(): void {
+		const engine = this.engine;
+		if (!engine) return;
+		const ws = new WebSocket(this.base().replace(/^http/, "ws") + "ws");
+		this.socket = ws;
+		let ping: number | null = null;
+		ws.onopen = () => {
+			this.retry = 0;
+			ping = window.setInterval(() => ws.readyState === WebSocket.OPEN && ws.send("ping"), 30000);
+		};
+		ws.onmessage = (e) => {
+			if (e.data === "pong") return;
+			const msg = JSON.parse(String(e.data)) as { type: string; seq?: number };
+			if ((msg.type === "changed" || msg.type === "hello") && (msg.seq ?? 0) > engine.state.cursor) {
+				this.track(engine.pull());
+			}
+		};
+		ws.onclose = () => {
+			if (ping !== null) window.clearInterval(ping);
+			if (this.socket !== ws || this.engine !== engine) return; // replaced or stopped
+			this.status("offline, retrying");
+			const delay = Math.min(60000, 1000 * 2 ** this.retry++);
+			this.retryTimer = window.setTimeout(() => this.connect(), delay);
+		};
+	}
+
+	private registerVaultEvents(): void {
+		const local = (path: string) => VaultFiles.toRemote(path, this.data.settings.folder);
+		this.registerEvent(
+			this.app.vault.on("modify", (f) => {
+				const p = f instanceof TFile ? local(f.path) : null;
+				if (p) this.schedulePush(p);
+			}),
+		);
+		this.registerEvent(
+			this.app.vault.on("create", (f) => {
+				const p = f instanceof TFile ? local(f.path) : null;
+				if (p) this.schedulePush(p);
+			}),
+		);
+		this.registerEvent(
+			this.app.vault.on("delete", (f) => {
+				const p = f instanceof TFile ? local(f.path) : null;
+				if (p) this.track(this.engine?.fileDeleted(p));
+			}),
+		);
+		this.registerEvent(
+			this.app.vault.on("rename", (f, oldPath) => {
+				if (!(f instanceof TFile)) return;
+				const from = local(oldPath);
+				const to = local(f.path);
+				if (from && to) this.track(this.engine?.fileRenamed(from, to));
+				else if (from) this.track(this.engine?.fileDeleted(from)); // moved out of the synced folder
+				else if (to) this.schedulePush(to); // moved in
+			}),
+		);
+	}
+
+	/** Typing fires many modify events; push once the file has been quiet for a moment. */
+	private schedulePush(path: string): void {
+		const existing = this.pending.get(path);
+		if (existing !== undefined) window.clearTimeout(existing);
+		this.pending.set(
+			path,
+			window.setTimeout(() => {
+				this.pending.delete(path);
+				this.track(this.engine?.fileChanged(path));
+			}, PUSH_DELAY_MS),
+		);
+	}
+
+	/** Errors are already reported through the engine's onError. */
+	private track(p: Promise<void> | undefined): void {
+		p?.then(
+			() => this.status("synced"),
+			() => {},
+		);
+	}
+
+	private status(text: string): void {
+		this.statusEl?.setText(`KB: ${text}`);
+	}
+
+	private fail(e: unknown): void {
+		console.error("Shared KB", e);
+		const msg = e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e);
+		this.status("error");
+		if (e instanceof ApiError && e.status === 401) new Notice(`Shared KB: ${msg}`, 15000);
+	}
+}
+
+/** Maps server paths onto a vault folder. */
+class VaultFiles implements LocalFiles {
+	constructor(
+		private readonly app: App,
+		private readonly folder: string,
+	) {}
+
+	/** Vault path → server path, or null if outside the synced folder or not Markdown. */
+	static toRemote(vaultPath: string, folder: string): string | null {
+		if (!vaultPath.toLowerCase().endsWith(".md")) return null;
+		const prefix = folder ? normalizePath(folder) + "/" : "";
+		if (prefix && !vaultPath.startsWith(prefix)) return null;
+		const p = vaultPath.slice(prefix.length);
+		return p.split("/").some((s) => s.startsWith(".")) ? null : p;
+	}
+
+	private local(p: string): string {
+		return normalizePath(this.folder ? `${this.folder}/${p}` : p);
+	}
+
+	private file(p: string): TFile | null {
+		const f = this.app.vault.getAbstractFileByPath(this.local(p));
+		return f instanceof TFile ? f : null;
+	}
+
+	list(): string[] {
+		return this.app.vault
+			.getMarkdownFiles()
+			.map((f) => VaultFiles.toRemote(f.path, this.folder))
+			.filter((p): p is string => p !== null);
+	}
+	exists(p: string): boolean {
+		return this.file(p) !== null;
+	}
+	async read(p: string): Promise<string> {
+		const f = this.file(p);
+		if (!f) throw new Error(`Missing file ${p}`);
+		return this.app.vault.read(f);
+	}
+	async write(p: string, content: string): Promise<void> {
+		const f = this.file(p);
+		if (f) return this.app.vault.modify(f, content);
+		await this.ensureFolder(this.local(p));
+		await this.app.vault.create(this.local(p), content);
+	}
+	async remove(p: string): Promise<void> {
+		const f = this.file(p);
+		if (f) await this.app.fileManager.trashFile(f);
+	}
+	async rename(from: string, to: string): Promise<void> {
+		const f = this.file(from);
+		if (!f) return;
+		await this.ensureFolder(this.local(to));
+		// vault.rename, not fileManager.renameFile: rewriting links in other notes would push edits nobody made.
+		await this.app.vault.rename(f, this.local(to));
+	}
+
+	private async ensureFolder(filePath: string): Promise<void> {
+		const dir = filePath.includes("/") ? filePath.slice(0, filePath.lastIndexOf("/")) : "";
+		if (!dir || this.app.vault.getAbstractFileByPath(dir) instanceof TFolder) return;
+		let current = "";
+		for (const part of dir.split("/")) {
+			current = current ? `${current}/${part}` : part;
+			if (!this.app.vault.getAbstractFileByPath(current)) await this.app.vault.createFolder(current);
+		}
+	}
+}
+
+class SettingsTab extends PluginSettingTab {
+	constructor(
+		app: App,
+		private readonly plugin: SharedKbPlugin,
+	) {
+		super(app, plugin);
+	}
+
+	display(): void {
+		const { containerEl } = this;
+		containerEl.empty();
+		const s = this.plugin.data.settings;
+		new Setting(containerEl)
+			.setName("Member link")
+			.setDesc("The private link you were given (it ends in /mcp or /). Anyone with it has your access, so keep it private.")
+			.addText((t) =>
+				t
+					.setPlaceholder("https://…/kb/…/…/")
+					.setValue(s.link)
+					.onChange(async (v) => {
+						s.link = v.trim();
+						await this.plugin.saveData(this.plugin.data);
+					}),
+			);
+		new Setting(containerEl)
+			.setName("Folder")
+			.setDesc("Vault folder to sync the knowledge base into. Leave empty to sync the whole vault.")
+			.addText((t) =>
+				t
+					.setPlaceholder("Shared")
+					.setValue(s.folder)
+					.onChange(async (v) => {
+						s.folder = v.trim().replace(/^\/+|\/+$/g, "");
+						this.plugin.data.stateLink = undefined; // a new folder needs a fresh first sync
+						await this.plugin.saveData(this.plugin.data);
+					}),
+			);
+		new Setting(containerEl).setName("Connect").setDesc("Apply these settings and sync now.").addButton((b) =>
+			b
+				.setButtonText("Connect & sync")
+				.setCta()
+				.onClick(() => void this.plugin.start()),
+		);
+	}
+}

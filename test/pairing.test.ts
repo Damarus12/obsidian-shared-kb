@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { deviceLabel, memberLinkFrom, normalizeServer, pairDevice, sameKnowledgeBase } from "../src/pairing";
+import { deviceLabel, formatCode, memberLinkFrom, normalizeServer, pairDevice, sameKnowledgeBase } from "../src/pairing";
 import { ApiError } from "../src/sync";
 import type { Requester } from "../src/http-api";
 
@@ -37,6 +37,24 @@ describe("memberLinkFrom", () => {
 		expect(memberLinkFrom("https://evil.example.com/steal")).toBeNull();
 		expect(memberLinkFrom("javascript:alert(1)")).toBeNull();
 		expect(memberLinkFrom("")).toBeNull();
+	});
+});
+
+describe("formatCode", () => {
+	it("uppercases and adds the dash as you type", () => {
+		expect(formatCode("k")).toBe("K");
+		expect(formatCode("k7p2")).toBe("K7P2");
+		expect(formatCode("k7p2q")).toBe("K7P2-Q");
+		expect(formatCode("k7p2qx9m")).toBe("K7P2-QX9M");
+	});
+
+	it("cleans up pasted codes and stops at 8 characters", () => {
+		expect(formatCode(" k7p2 - qx9m ")).toBe("K7P2-QX9M");
+		expect(formatCode("K7P2-QX9M-EXTRA")).toBe("K7P2-QX9M");
+	});
+
+	it("lets backspace remove the dash", () => {
+		expect(formatCode("K7P2-")).toBe("K7P2");
 	});
 });
 

@@ -15,6 +15,12 @@ export function normalizeServer(input: string): string {
 	return url.origin;
 }
 
+/** Formats a pairing code as it's typed: uppercase, letters and digits only, "XXXX-XXXX". */
+export function formatCode(input: string): string {
+	const chars = input.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8);
+	return chars.length > 4 ? `${chars.slice(0, 4)}-${chars.slice(4)}` : chars;
+}
+
 /** Which Obsidian.Platform flags are set. */
 export type PlatformFlags = Partial<Record<"isIosApp" | "isAndroidApp" | "isTablet" | "isMacOS" | "isWin" | "isLinux", boolean>>;
 

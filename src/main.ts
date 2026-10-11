@@ -1,6 +1,6 @@
 import { App, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, TFile, TFolder, normalizePath, requestUrl } from "obsidian";
 import { HttpApi, type Requester } from "./http-api";
-import { deviceLabel, memberLinkFrom, normalizeServer, pairDevice, sameKnowledgeBase } from "./pairing";
+import { deviceLabel, formatCode, memberLinkFrom, normalizeServer, pairDevice, sameKnowledgeBase } from "./pairing";
 import { ApiError, emptyState, SyncEngine, type LocalFiles, type SyncState } from "./sync";
 
 interface Settings {
@@ -374,7 +374,14 @@ class SettingsTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Code")
 			.setDesc("A one-time code from the person who runs the knowledge base. It works once, for 10 minutes.")
-			.addText((t) => t.setPlaceholder("XXXX-XXXX").onChange((v) => (code = v)))
+			.addText((t) => {
+				t.inputEl.autocapitalize = "characters";
+				t.inputEl.spellcheck = false;
+				t.setPlaceholder("XXXX-XXXX").onChange((v) => {
+					code = formatCode(v);
+					if (code !== v) t.setValue(code);
+				});
+			})
 			.addButton((b) =>
 				b
 					.setButtonText("Pair")

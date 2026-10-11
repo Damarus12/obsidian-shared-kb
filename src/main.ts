@@ -1,12 +1,15 @@
-import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, normalizePath, requestUrl } from "obsidian";
+import { App, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, TFile, TFolder, normalizePath, requestUrl } from "obsidian";
 import { HttpApi, type Requester } from "./http-api";
+import { deviceLabel, memberLinkFrom, normalizeServer, pairDevice, sameKnowledgeBase } from "./pairing";
 import { ApiError, emptyState, SyncEngine, type LocalFiles, type SyncState } from "./sync";
 
 interface Settings {
-	/** The member link from the admin, e.g. https://kb.example.workers.dev/kb/abc/token/ */
+	/** This device's member link, e.g. https://kb.example.com/kb/abc/token/ */
 	link: string;
 	/** Vault folder that mirrors the knowledge base ("" = whole vault). */
 	folder: string;
+	/** Who this link belongs to, e.g. "Sean · Obsidian (iPhone)" (display only). */
+	who: string;
 }
 
 interface Data {
@@ -16,7 +19,7 @@ interface Data {
 	stateLink?: string;
 }
 
-const DEFAULTS: Settings = { link: "", folder: "" };
+const DEFAULTS: Settings = { link: "", folder: "", who: "" };
 
 /** requestUrl skips CORS and works on mobile; errors come back as status codes. */
 const obsidianRequest: Requester = async ({ url, method, body }) => {
@@ -56,6 +59,8 @@ export default class SharedKbPlugin extends Plugin {
 			name: "Open knowledge base in browser",
 			callback: () => this.data.settings.link && window.open(this.base()),
 		});
+		// "Open in Obsidian" on the server's pairing page: obsidian://shared-kb?link=<this device's link>
+		this.registerObsidianProtocolHandler("shared-kb", (params) => this.offerLink(params.link ?? ""));
 		this.app.workspace.onLayoutReady(() => {
 			this.registerVaultEvents();
 			void this.start();
@@ -76,7 +81,8 @@ export default class SharedKbPlugin extends Plugin {
 		const { link } = this.data.settings;
 		if (!link) return this.status("not set up");
 		if (this.data.stateLink !== link) {
-			this.data.state = emptyState();
+			// A new link for the same knowledge base (e.g. this device's own) keeps what's already synced.
+			if (!sameKnowledgeBase(this.data.stateLink, link)) this.data.state = emptyState();
 			this.data.stateLink = link;
 		}
 		this.engine = new SyncEngine(new HttpApi(this.base(), obsidianRequest), new VaultFiles(this.app, this.data.settings.folder), this.data.state, () => this.saveData(this.data), {
@@ -85,6 +91,20 @@ export default class SharedKbPlugin extends Plugin {
 		});
 		await this.syncNow();
 		this.connect();
+		if (!this.data.settings.who) await this.lookupWho();
+	}
+
+	/** Fills in who this link belongs to, for the settings tab. */
+	private async lookupWho(): Promise<void> {
+		try {
+			const res = await obsidianRequest({ url: `${this.base()}api/me`, method: "GET" });
+			const me = res.json as { name?: string; device?: string; role?: string } | null;
+			if (res.status !== 200 || !me?.name) return;
+			this.data.settings.who = `${me.name}${me.device ? ` · ${me.device}` : ""}${me.role === "read" ? " (read-only)" : ""}`;
+			await this.saveData(this.data);
+		} catch {
+			// Offline; try again next start.
+		}
 	}
 
 	async syncNow(): Promise<void> {
@@ -100,6 +120,37 @@ export default class SharedKbPlugin extends Plugin {
 
 	base(): string {
 		return this.data.settings.link.trim().replace(/\/(mcp)?\/?$/, "") + "/";
+	}
+
+	/** Trades a one-time code from the server's Devices page for this device's own link, then syncs. */
+	async pair(server: string, code: string): Promise<void> {
+		const paired = await pairDevice(obsidianRequest, server, code, deviceLabel(Platform));
+		await this.useLink(paired.link, `${paired.name}${paired.device ? ` · ${paired.device}` : ""}${paired.role === "read" ? " (read-only)" : ""}`);
+		new Notice(`Shared KB: connected as ${this.data.settings.who}.`);
+	}
+
+	async useLink(link: string, who: string): Promise<void> {
+		this.data.settings.link = link;
+		this.data.settings.who = who;
+		await this.saveData(this.data);
+		await this.start();
+	}
+
+	/** A link that arrived by obsidian:// URL. Any web page can open one, so the person confirms first. */
+	private offerLink(raw: string): void {
+		const link = memberLinkFrom(raw);
+		if (!link) {
+			new Notice("Shared KB: that wasn't a valid link.");
+			return;
+		}
+		const { folder } = this.data.settings;
+		new ConfirmModal(
+			this.app,
+			"Connect to a knowledge base?",
+			`Notes in ${folder ? `the "${folder}" folder` : "this whole vault"} will sync with ${new URL(link).host}. Only continue if you just tapped "Open in Obsidian" on your own device.`,
+			"Connect",
+			() => void this.useLink(link, "").then(() => new Notice(`Shared KB: connected to ${new URL(link).host}.`)),
+		).open();
 	}
 
 	private stop(): void {
@@ -308,15 +359,51 @@ class SettingsTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 		const s = this.plugin.data.settings;
+		const host = s.link ? safeHost(s.link) : "";
+		new Setting(containerEl)
+			.setName("Status")
+			.setDesc(s.link ? `Connected to ${host}${s.who ? ` as ${s.who}` : ""}.` : "Not connected yet. Pair with a code, or paste a link below.");
+
+		new Setting(containerEl).setName("Pair with a code").setHeading();
+		let server = host;
+		let code = "";
+		new Setting(containerEl)
+			.setName("Server")
+			.setDesc("The knowledge base's address.")
+			.addText((t) => t.setPlaceholder("kb.example.com").setValue(server).onChange((v) => (server = v)));
+		new Setting(containerEl)
+			.setName("Code")
+			.setDesc("On a device that's already connected, open the notes in a browser → Devices → Add a device.")
+			.addText((t) => t.setPlaceholder("XXXX-XXXX").onChange((v) => (code = v)))
+			.addButton((b) =>
+				b
+					.setButtonText("Pair")
+					.setCta()
+					.onClick(async () => {
+						b.setDisabled(true);
+						try {
+							normalizeServer(server);
+							await this.plugin.pair(server, code);
+							this.display();
+						} catch (e) {
+							new Notice(`Shared KB: ${e instanceof Error ? e.message : String(e)}`, 10000);
+						} finally {
+							b.setDisabled(false);
+						}
+					}),
+			);
+
+		new Setting(containerEl).setName("Sync").setHeading();
 		new Setting(containerEl)
 			.setName("Member link")
-			.setDesc("The private link you were given (it ends in /mcp or /). Anyone with it has your access, so keep it private.")
+			.setDesc("Filled in by pairing. Or paste a private link you were given (it ends in /mcp or /). Anyone with it has your access, so keep it private.")
 			.addText((t) =>
 				t
 					.setPlaceholder("https://…/kb/…/…/")
 					.setValue(s.link)
 					.onChange(async (v) => {
 						s.link = v.trim();
+						s.who = "";
 						await this.plugin.saveData(this.plugin.data);
 					}),
 			);
@@ -337,7 +424,50 @@ class SettingsTab extends PluginSettingTab {
 			b
 				.setButtonText("Connect & sync")
 				.setCta()
-				.onClick(() => void this.plugin.start()),
+				.onClick(async () => {
+					await this.plugin.start();
+					this.display();
+				}),
 		);
+	}
+}
+
+function safeHost(link: string): string {
+	try {
+		return new URL(link).host;
+	} catch {
+		return "";
+	}
+}
+
+class ConfirmModal extends Modal {
+	constructor(
+		app: App,
+		private readonly heading: string,
+		private readonly message: string,
+		private readonly confirmText: string,
+		private readonly onConfirm: () => void,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.titleEl.setText(this.heading);
+		this.contentEl.createEl("p", { text: this.message });
+		new Setting(this.contentEl)
+			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()))
+			.addButton((b) =>
+				b
+					.setButtonText(this.confirmText)
+					.setCta()
+					.onClick(() => {
+						this.close();
+						this.onConfirm();
+					}),
+			);
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
 	}
 }

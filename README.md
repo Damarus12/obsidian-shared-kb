@@ -20,9 +20,11 @@ Edit a note in Obsidian and everyone else sees it within seconds. When someone (
 
 Settings → Shared KB:
 
-- **Member link:** paste your link (ending in `/` or `/mcp`).
+- **Pair with a code** (easiest): on a device that's already connected, open the knowledge base in a browser → **Devices → Add a device**. In Obsidian, enter the server address (e.g. `kb.example.com`) and the code, then **Pair**. This device gets its own link, which you can remove later from the Devices page.
+  - Or scan the QR code with your phone's camera, enter the code in the browser, and tap **Open in Obsidian**. Obsidian asks before connecting.
+- **Member link:** or paste a link you were given (ending in `/` or `/mcp`).
 - **Folder:** the vault folder to sync into, or empty for the whole vault. A new, empty vault is simplest.
-- **Connect & sync.** The status bar shows `KB: synced`.
+- **Connect & sync.** On desktop the status bar shows `KB: synced`.
 
 Commands: **Sync now**, **Open knowledge base in browser**.
 
@@ -36,7 +38,8 @@ Commands: **Sync now**, **Open knowledge base in browser**.
 
 ## Network use and privacy
 
-- The plugin talks **only to the server in your member link**: HTTPS for notes and a WebSocket for change notifications. No telemetry, no other services.
+- The plugin talks **only to the server in your member link** (and, when pairing, the server address you type): HTTPS for notes and a WebSocket for change notifications. No telemetry, no other services.
+- An `obsidian://shared-kb?link=…` URL can propose a link; the plugin always asks you to confirm, showing the server, before using it.
 - Notes in the synced folder are sent to that server and stored there.
 - Your member link is a credential (anyone with it has your access). It's stored in this plugin's `data.json` inside your vault's `.obsidian` folder, so don't share that file or commit it to a public repo.
 

@@ -94,7 +94,7 @@ export default class SharedKbPlugin extends Plugin {
 			await this.engine.fullSync();
 			this.status("synced");
 		} catch (e) {
-			this.fail(e);
+			this.fail(e, true);
 		}
 	}
 
@@ -124,8 +124,12 @@ export default class SharedKbPlugin extends Plugin {
 			ping = window.setInterval(() => ws.readyState === WebSocket.OPEN && ws.send("ping"), 30000);
 		};
 		ws.onmessage = (e) => {
-			if (e.data === "pong") return;
-			const msg = JSON.parse(String(e.data)) as { type: string; seq?: number };
+			let msg: { type?: string; seq?: number };
+			try {
+				msg = JSON.parse(String(e.data)) as typeof msg;
+			} catch {
+				return; // "pong", or anything else that isn't an event
+			}
 			if ((msg.type === "changed" || msg.type === "hello") && (msg.seq ?? 0) > engine.state.cursor) {
 				this.track(engine.pull());
 			}
@@ -196,11 +200,16 @@ export default class SharedKbPlugin extends Plugin {
 		this.statusEl?.setText(`KB: ${text}`);
 	}
 
-	private fail(e: unknown): void {
+	/** Background errors only show in the status bar; a failed full sync (startup, "Sync now") also gets a notice. */
+	private fail(e: unknown, notify = false): void {
 		console.error("Shared KB", e);
-		const msg = e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e);
 		this.status("error");
-		if (e instanceof ApiError && e.status === 401) new Notice(`Shared KB: ${msg}`, 15000);
+		if (!notify) return;
+		const badLink = e instanceof ApiError && [401, 403, 404].includes(e.status);
+		const msg = badLink
+			? "This link isn't valid (it may be incomplete, or was revoked). Copy it again, or ask for a new one."
+			: `Sync failed: ${e instanceof Error ? e.message : String(e)}`;
+		new Notice(`Shared KB: ${msg}`, 15000);
 	}
 }
 

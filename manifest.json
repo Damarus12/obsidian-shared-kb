@@ -1,9 +1,10 @@
 {
 	"id": "shared-kb",
 	"name": "Shared KB",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"minAppVersion": "1.6.6",
 	"description": "Two-way sync between a vault folder and a shared-kb knowledge base that people and their AI assistants edit together.",
 	"author": "Damarus12",
+	"authorUrl": "https://github.com/Damarus12",
 	"isDesktopOnly": false
 }

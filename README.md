@@ -20,8 +20,8 @@ Edit a note in Obsidian and everyone else sees it within seconds. When someone (
 
 Settings → Shared KB:
 
-- **Pair with a code** (easiest): on a device that's already connected, open the knowledge base in a browser → **Devices → Add a device**. In Obsidian, enter the server address (e.g. `kb.example.com`) and the code, then **Pair**. This device gets its own link, which you can remove later from the Devices page.
-  - Or scan the QR code with your phone's camera, enter the code in the browser, and tap **Open in Obsidian**. Obsidian asks before connecting.
+- **Pair with a code** (easiest): ask the person who runs the knowledge base for a one-time code (they make it on the server's admin page). In Obsidian, enter the server address (e.g. `kb.example.com`) and the code, then **Pair**. This device gets its own link, which can be removed later on its own.
+  - Or scan their QR code with your phone's camera, tap **Connect** in the browser, then **Open in Obsidian**. Obsidian asks before connecting.
 - **Member link:** or paste a link you were given (ending in `/` or `/mcp`).
 - **Folder:** the vault folder to sync into, or empty for the whole vault. A new, empty vault is simplest.
 - **Connect & sync.** On desktop the status bar shows `KB: synced`.

@@ -373,7 +373,7 @@ class SettingsTab extends PluginSettingTab {
 			.addText((t) => t.setPlaceholder("kb.example.com").setValue(server).onChange((v) => (server = v)));
 		new Setting(containerEl)
 			.setName("Code")
-			.setDesc("On a device that's already connected, open the notes in a browser → Devices → Add a device.")
+			.setDesc("A one-time code from the person who runs the knowledge base. It works once, for 10 minutes.")
 			.addText((t) => t.setPlaceholder("XXXX-XXXX").onChange((v) => (code = v)))
 			.addButton((b) =>
 				b

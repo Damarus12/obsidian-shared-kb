@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-shared-kb",
-	"version": "0.1.1",
+	"version": "0.2.0",
 	"description": "Obsidian plugin: two-way sync between a vault folder and a shared-kb knowledge base.",
 	"private": true,
 	"license": "MIT",

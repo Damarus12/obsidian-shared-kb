@@ -336,14 +336,23 @@ class VaultFiles implements LocalFiles {
 		await this.pruneEmpty(this.local(from));
 	}
 
-	/** After a sync removes or moves a file away, delete folders it left empty (never the sync folder itself). */
+	/**
+	 * After a sync removes or moves a file away, trash folders it left empty (never the sync folder itself).
+	 * Tidying only: a folder that can't be removed stays, and the sync carries on.
+	 * (vault.delete(folder) fails with EISDIR on Windows, so folders go through trashFile like files do.)
+	 */
 	private async pruneEmpty(filePath: string): Promise<void> {
 		const root = this.folder ? normalizePath(this.folder) : "";
 		let dir = filePath.includes("/") ? filePath.slice(0, filePath.lastIndexOf("/")) : "";
 		while (dir && dir !== root) {
 			const folder = this.app.vault.getAbstractFileByPath(dir);
 			if (!(folder instanceof TFolder) || folder.children.length > 0) return;
-			await this.app.vault.delete(folder);
+			try {
+				await this.app.fileManager.trashFile(folder);
+			} catch (e) {
+				console.warn(`Shared KB: couldn't remove empty folder ${dir}`, e);
+				return;
+			}
 			dir = dir.includes("/") ? dir.slice(0, dir.lastIndexOf("/")) : "";
 		}
 	}

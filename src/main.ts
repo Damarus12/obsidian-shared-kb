@@ -42,6 +42,8 @@ export default class SharedKbPlugin extends Plugin {
 	private retry = 0;
 	private retryTimer: number | null = null;
 	private pending = new Map<string, number>();
+	/** Files the server refused this session, so each gets one notice. */
+	private denied = new Set<string>();
 	private statusEl: HTMLElement | null = null;
 
 	async onload(): Promise<void> {
@@ -87,6 +89,11 @@ export default class SharedKbPlugin extends Plugin {
 		}
 		this.engine = new SyncEngine(new HttpApi(this.base(), obsidianRequest), new VaultFiles(this.app, this.data.settings.folder), this.data.state, () => this.saveData(this.data), {
 			onConflict: (path, copy) => new Notice(`Shared KB: "${path}" changed on the server while you edited it. Your version is in "${copy}".`, 15000),
+			onDenied: (path) => {
+				if (this.denied.has(path)) return;
+				this.denied.add(path);
+				new Notice(`Shared KB: you can't change "${path}" (no write access to that folder). It isn't synced.`, 15000);
+			},
 			onError: (e) => this.fail(e),
 		});
 		await this.syncNow();
@@ -182,6 +189,11 @@ export default class SharedKbPlugin extends Plugin {
 				return; // "pong", or anything else that isn't an event
 			}
 			if ((msg.type === "changed" || msg.type === "hello") && (msg.seq ?? 0) > engine.state.cursor) {
+				this.track(engine.pull());
+			}
+			// This link's access changed: the pull sees a new scope and syncs the folders again.
+			if (msg.type === "access") {
+				this.denied.clear();
 				this.track(engine.pull());
 			}
 		};

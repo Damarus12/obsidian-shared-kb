@@ -6,6 +6,10 @@ class FakeServer implements Api {
 	notes = new Map<string, RemoteNote & { deleted: boolean; seq: number }>();
 	seq = 0;
 	private nextId = 1;
+	/** This vault's access (the server's per-folder rules), and its fingerprint. */
+	canRead = (_path: string) => true;
+	canWrite = (_path: string) => true;
+	scope = "all";
 
 	live(path: string) {
 		return [...this.notes.values()].find((n) => n.path === path && !n.deleted);
@@ -19,8 +23,12 @@ class FakeServer implements Api {
 		const changes: Change[] = [...this.notes.values()]
 			.filter((n) => n.seq > since)
 			.sort((a, b) => a.seq - b.seq)
-			.map((n) => ({ id: n.id, path: n.path, version: n.version, seq: n.seq, deleted: n.deleted, content: n.deleted ? undefined : n.content }));
-		return { changes, cursor: changes.at(-1)?.seq ?? since, more: false };
+			.map((n) =>
+				this.canRead(n.path)
+					? { id: n.id, path: n.path, version: n.version, seq: n.seq, deleted: n.deleted, content: n.deleted ? undefined : n.content }
+					: { id: n.id, path: "", version: n.version, seq: n.seq, deleted: true, hidden: true },
+			);
+		return { changes, cursor: changes.at(-1)?.seq ?? since, more: false, scope: this.scope };
 	}
 	async get(path: string) {
 		const n = this.live(path);
@@ -28,6 +36,7 @@ class FakeServer implements Api {
 		return { ...n };
 	}
 	async put(path: string, content: string, base: number | null) {
+		if (!this.canWrite(path)) throw new ApiError(403, "forbidden", path);
 		const n = this.live(path);
 		if (!n) {
 			if (base) throw new ApiError(404, "not_found", path);
@@ -41,6 +50,7 @@ class FakeServer implements Api {
 		return { ...n };
 	}
 	async move(path: string, newPath: string, base: number) {
+		if (!this.canWrite(path) || !this.canWrite(newPath)) throw new ApiError(403, "forbidden", path);
 		const n = this.live(path);
 		if (!n) throw new ApiError(404, "not_found", path);
 		if (base !== n.version) throw new ApiError(409, "conflict", path);
@@ -48,6 +58,7 @@ class FakeServer implements Api {
 		return { ...n };
 	}
 	async delete(path: string, base: number) {
+		if (!this.canWrite(path)) throw new ApiError(403, "forbidden", path);
 		const n = this.live(path);
 		if (!n) throw new ApiError(404, "not_found", path);
 		if (base !== n.version) throw new ApiError(409, "conflict", path);
@@ -85,12 +96,21 @@ let server: FakeServer;
 let files: FakeFiles;
 let engine: SyncEngine;
 let conflicts: string[];
+let denied: string[];
 
 beforeEach(async () => {
 	server = new FakeServer();
 	files = new FakeFiles();
 	conflicts = [];
-	engine = new SyncEngine(server, files, emptyState(), async () => {}, { onConflict: (_p, copy) => conflicts.push(copy) }, () => new Date("2026-10-10T12:34:00Z"));
+	denied = [];
+	engine = new SyncEngine(
+		server,
+		files,
+		emptyState(),
+		async () => {},
+		{ onConflict: (_p, copy) => conflicts.push(copy), onDenied: (p) => denied.push(p) },
+		() => new Date("2026-10-10T12:34:00Z"),
+	);
 });
 
 describe("SyncEngine", () => {
@@ -211,5 +231,50 @@ describe("SyncEngine", () => {
 		await files.remove("a.md");
 		await engine.fileDeleted("a.md");
 		expect(files.files.get("a.md")).toBe("A edited");
+	});
+
+	it("pulls everything again when its access changes, and drops notes that left its reach", async () => {
+		await server.external("shared/a.md", "A");
+		await server.external("private/b.md", "B");
+		server.canRead = (p) => p.startsWith("shared/");
+		server.scope = "shared";
+		await engine.fullSync();
+		expect([...files.files.keys()]).toEqual(["shared/a.md"]);
+
+		server.canRead = () => true;
+		server.scope = "all";
+		await engine.pull(); // nothing new since the cursor, but the scope changed
+		expect(files.files.get("private/b.md")).toBe("B");
+
+		server.canRead = (p) => p.startsWith("shared/");
+		server.scope = "shared";
+		await engine.pull();
+		expect(files.exists("private/b.md")).toBe(false);
+		expect(files.files.get("shared/a.md")).toBe("A");
+	});
+
+	it("skips files it may not change instead of stopping the sync", async () => {
+		server.canWrite = (p) => p.startsWith("mine/");
+		files.files.set("theirs/a.md", "x");
+		files.files.set("mine/b.md", "y");
+		await engine.fullSync();
+		expect(denied).toEqual(["theirs/a.md"]);
+		expect(server.live("mine/b.md")?.content).toBe("y");
+		expect(server.live("theirs/a.md")).toBeUndefined();
+	});
+
+	it("puts back a file deleted or renamed where it may not change anything", async () => {
+		await server.external("ro/a.md", "A");
+		await server.external("ro/b.md", "B");
+		server.canWrite = () => false;
+		await engine.fullSync();
+		await files.remove("ro/a.md");
+		await engine.fileDeleted("ro/a.md");
+		expect(files.files.get("ro/a.md")).toBe("A");
+		await files.rename("ro/b.md", "ro/c.md");
+		await engine.fileRenamed("ro/b.md", "ro/c.md");
+		expect(files.files.get("ro/b.md")).toBe("B");
+		expect(files.exists("ro/c.md")).toBe(false);
+		expect(denied).toEqual(["ro/a.md", "ro/b.md"]);
 	});
 });

@@ -10,6 +10,10 @@
  *   which is not synced, and the server's text takes the original path.
  * - State is updated *before* touching files, so the file events our own
  *   writes trigger are recognized as already in sync and ignored.
+ * - The server may give this vault access to some folders only. Notes outside
+ *   it arrive as `hidden` deletes; when the access changes (a new `scope`), the
+ *   whole feed is pulled again. Changes the server refuses (403) are skipped,
+ *   and a refused delete or rename is undone locally.
  */
 
 export interface RemoteNote {
@@ -26,6 +30,8 @@ export interface Change {
 	seq: number;
 	deleted: boolean;
 	content?: string;
+	/** Outside this vault's access: drop the local copy. */
+	hidden?: boolean;
 }
 
 export class ApiError extends Error {
@@ -39,7 +45,8 @@ export class ApiError extends Error {
 }
 
 export interface Api {
-	changes(since: number): Promise<{ changes: Change[]; cursor: number; more: boolean }>;
+	/** `scope` (newer servers) changes whenever this link's access does. */
+	changes(since: number): Promise<{ changes: Change[]; cursor: number; more: boolean; scope?: string }>;
 	get(path: string): Promise<RemoteNote>;
 	put(path: string, content: string, baseVersion: number | null): Promise<RemoteNote>;
 	move(path: string, newPath: string, baseVersion: number): Promise<RemoteNote>;
@@ -58,6 +65,8 @@ export interface LocalFiles {
 
 export interface SyncState {
 	cursor: number;
+	/** The server's `scope` at the last pull. */
+	scope?: string;
 	/** By note id: where it lives locally, the version we have, and a hash of its synced text. */
 	notes: Record<string, { path: string; version: number; hash: string }>;
 }
@@ -94,6 +103,8 @@ export function hash(s: string): string {
 
 export interface SyncEvents {
 	onConflict?(path: string, copy: string): void;
+	/** The server refused a change to `path` (no write access there). */
+	onDenied?(path: string): void;
 	onError?(error: unknown): void;
 }
 
@@ -152,7 +163,10 @@ export class SyncEngine {
 			} catch (e) {
 				if (status(e) === 404) delete this.state.notes[id];
 				else if (status(e) === 409) await this.pullNow(); // changed remotely: the pull brings it back
-				else throw e;
+				else if (status(e) === 403) {
+					this.events.onDenied?.(path);
+					await this.restore(id, path);
+				} else throw e;
 			}
 			await this.save(this.state);
 		});
@@ -171,7 +185,10 @@ export class SyncEngine {
 					entry.version = moved.version;
 				} catch (e) {
 					if (status(e) === 409) await this.pullNow();
-					else throw e;
+					else if (status(e) === 403) {
+						this.events.onDenied?.(from);
+						if (this.files.exists(to) && !this.files.exists(from)) await this.files.rename(to, from);
+					} else throw e;
 				}
 			}
 			await this.save(this.state);
@@ -193,6 +210,14 @@ export class SyncEngine {
 	private async pullNow(): Promise<void> {
 		for (;;) {
 			const page = await this.api.changes(this.state.cursor);
+			if (page.scope !== undefined && page.scope !== this.state.scope) {
+				// Access changed: notes shared with us earlier than the cursor must come down too.
+				this.state.scope = page.scope;
+				if (this.state.cursor !== 0) {
+					this.state.cursor = 0;
+					continue;
+				}
+			}
 			for (const change of page.changes) await this.apply(change);
 			this.state.cursor = page.cursor;
 			if (!page.more) return;
@@ -201,7 +226,9 @@ export class SyncEngine {
 
 	private async apply(change: Change): Promise<void> {
 		const entry = this.state.notes[change.id];
-		if (entry && entry.version >= change.version) return; // our own write echoing back
+		// A note can leave our reach without changing version, so deletes skip the echo check
+		// (the feed only ever sends a note's latest state, so a delete is never stale).
+		if (!change.deleted && entry && entry.version >= change.version) return; // our own write echoing back
 
 		if (change.deleted) {
 			if (!entry) return;
@@ -264,6 +291,8 @@ export class SyncEngine {
 		} catch (e) {
 			// Someone else changed or created this note: pull, which turns our text into a conflict copy.
 			if (status(e) === 409) await this.pullNow();
+			// No write access there: leave the file alone and keep syncing the rest.
+			else if (status(e) === 403) this.events.onDenied?.(path);
 			else throw e;
 		}
 	}

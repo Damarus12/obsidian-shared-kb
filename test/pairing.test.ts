@@ -72,10 +72,10 @@ describe("pairDevice", () => {
 		const calls: Array<{ url: string; body?: string }> = [];
 		const request: Requester = async (req) => {
 			calls.push(req);
-			return { status: 200, json: { name: "Sean", role: "write", device: "Obsidian (iPhone)", link: "https://kb.example.com/kb/k/t/", mcp: "https://kb.example.com/kb/k/t/mcp" } };
+			return { status: 200, json: { name: "Alex", role: "write", device: "Obsidian (iPhone)", link: "https://kb.example.com/kb/k/t/", mcp: "https://kb.example.com/kb/k/t/mcp" } };
 		};
 		const out = await pairDevice(request, "kb.example.com", "k7p2-qx9m", "Obsidian (iPhone)");
-		expect(out).toMatchObject({ name: "Sean", link: "https://kb.example.com/kb/k/t/" });
+		expect(out).toMatchObject({ name: "Alex", link: "https://kb.example.com/kb/k/t/" });
 		expect(calls[0].url).toBe("https://kb.example.com/pair/api");
 		expect(JSON.parse(calls[0].body!)).toEqual({ code: "k7p2-qx9m", device: "Obsidian (iPhone)" });
 	});

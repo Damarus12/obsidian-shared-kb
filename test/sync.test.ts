@@ -9,7 +9,7 @@ class FakeServer implements Api {
 	/** This vault's access (the server's per-folder rules), and its fingerprint. */
 	canRead = (_path: string) => true;
 	canWrite = (_path: string) => true;
-	scope = "all";
+	scope: string | undefined = "all";
 
 	live(path: string) {
 		return [...this.notes.values()].find((n) => n.path === path && !n.deleted);
@@ -251,6 +251,17 @@ describe("SyncEngine", () => {
 		await engine.pull();
 		expect(files.exists("private/b.md")).toBe(false);
 		expect(files.files.get("shared/a.md")).toBe("A");
+	});
+
+	it("works with an older server that sends no access scope", async () => {
+		server.scope = undefined;
+		await server.external("a.md", "A");
+		await engine.fullSync();
+		await server.external("b.md", "B");
+		await engine.pull();
+		expect(engine.state.scope).toBeUndefined();
+		expect(engine.state.cursor).toBe(2);
+		expect([...files.files.keys()].sort()).toEqual(["a.md", "b.md"]);
 	});
 
 	it("skips files it may not change instead of stopping the sync", async () => {

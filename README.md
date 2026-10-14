@@ -4,7 +4,7 @@ Two-way sync between an Obsidian vault folder and a **shared-kb** knowledge base
 
 Edit a note in Obsidian and everyone else sees it within seconds. When someone (or their AI) changes a note, it updates in your vault live.
 
-> **You need a shared-kb server and a member link.** The plugin does nothing on its own. The server isn't published yet; if someone invited you, they gave you a link.
+> **You need a shared-kb server and a private link.** The plugin does nothing on its own. The server isn't published yet; if someone invited you, they gave you a link.
 
 ## Install
 
@@ -22,7 +22,7 @@ Settings → Shared KB:
 
 - **Pair with a code** (easiest): ask the person who runs the knowledge base for a one-time code (they make it on the server's admin page). In Obsidian, enter the server address (e.g. `kb.example.com`) and the code, then **Pair**. This device gets its own link, which can be removed later on its own.
   - Or scan their QR code with your phone's camera, tap **Connect** in the browser, then **Open in Obsidian**. Obsidian asks before connecting.
-- **Member link:** or paste a link you were given (ending in `/` or `/mcp`).
+- **Private link:** or paste a link you were given (ending in `/` or `/mcp`).
 - **Folder:** the vault folder to sync into, or empty for the whole vault. A new, empty vault is simplest.
 - **Connect & sync.** On desktop the status bar shows `KB: synced`.
 
@@ -33,15 +33,20 @@ Commands: **Sync now**, **Open knowledge base in browser**.
 - The server is the source of truth. Every note has a version; the plugin sends the version it last saw with each change, so it never overwrites an edit it hasn't seen.
 - **Conflicts:** if a note changed on the server while you had unsynced edits, the server's version takes the file and yours is saved beside it as `Name (conflict 2026-10-10 1234).md`. Conflict copies aren't synced. Merge by hand, then delete the copy.
 - Files deleted while Obsidian was closed are restored from the server, not deleted for everyone. Deleting a note while Obsidian is open deletes it for everyone (the server keeps its history, so it can be restored).
+- When a note moves or is deleted, folders it leaves empty are removed (to the trash). Versions before 0.3.1 could leave them behind on Windows; 0.3.2 removes those once, after its first sync, in vaults that had synced before.
 - Only `.md` files sync. Hidden folders (starting with `.`) are skipped. Images and attachments aren't supported yet.
 - Live updates over a WebSocket, plus a check every 5 minutes and whenever the app comes back to the foreground.
 
 ## Network use and privacy
 
-- The plugin talks **only to the server in your member link** (and, when pairing, the server address you type): HTTPS for notes and a WebSocket for change notifications. No telemetry, no other services.
+- The plugin talks **only to the server in your private link** (and, when pairing, the server address you type): HTTPS for notes and a WebSocket for change notifications. No telemetry, no other services.
 - An `obsidian://shared-kb?link=…` URL can propose a link; the plugin always asks you to confirm, showing the server, before using it.
 - Notes in the synced folder are sent to that server and stored there.
-- Your member link is a credential (anyone with it has your access). It's stored in this plugin's `data.json` inside your vault's `.obsidian` folder, so don't share that file or commit it to a public repo.
+- Your private link is a credential (anyone with it has your access). It's stored in this plugin's `data.json` inside your vault's `.obsidian` folder, so don't share that file or commit it to a public repo.
+
+## Compatibility
+
+Any plugin version works with any server version: newer fields are optional on both sides. Keep it that way (see `CLAUDE.md`).
 
 ## Develop
 
@@ -52,7 +57,7 @@ npm run typecheck
 npm run build       # → dist/main.js
 ```
 
-`test/integration.test.ts` runs two simulated vaults against a real server; it's skipped unless `KB_TEST_LINK` is set to a member link.
+`test/integration.test.ts` runs two simulated vaults against a real server; it's skipped unless `KB_TEST_LINK` is set to a private link.
 
 **Release:** `npm version <x.y.z>` (updates `manifest.json` and `versions.json`), then `git push --follow-tags`. The Release workflow builds and attaches `main.js` and `manifest.json`.
 

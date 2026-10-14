@@ -2,13 +2,14 @@ import { App, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, TFile,
 import { HttpApi, type Requester } from "./http-api";
 import { deviceLabel, formatCode, memberLinkFrom, normalizeServer, pairDevice, sameKnowledgeBase } from "./pairing";
 import { ApiError, emptyState, SyncEngine, type LocalFiles, type SyncState } from "./sync";
+import { emptyFolders } from "./tidy";
 
 interface Settings {
 	/** This device's member link, e.g. https://kb.example.com/kb/abc/token/ */
 	link: string;
 	/** Vault folder that mirrors the knowledge base ("" = whole vault). */
 	folder: string;
-	/** Who this link belongs to, e.g. "Sean · Obsidian (iPhone)" (display only). */
+	/** Who this link belongs to, e.g. "Alex · iPhone" (display only). */
 	who: string;
 }
 
@@ -17,6 +18,8 @@ interface Data {
 	state: SyncState;
 	/** The link the state belongs to; a different link starts a fresh sync. */
 	stateLink?: string;
+	/** Empty folders left by versions before 0.3.1 were removed (done once, after a sync). */
+	tidied?: boolean;
 }
 
 const DEFAULTS: Settings = { link: "", folder: "", who: "" };
@@ -38,6 +41,7 @@ const POLL_MS = 5 * 60 * 1000;
 export default class SharedKbPlugin extends Plugin {
 	data: Data = { settings: { ...DEFAULTS }, state: emptyState() };
 	private engine: SyncEngine | null = null;
+	private files: VaultFiles | null = null;
 	private socket: WebSocket | null = null;
 	private retry = 0;
 	private retryTimer: number | null = null;
@@ -52,6 +56,8 @@ export default class SharedKbPlugin extends Plugin {
 			settings: { ...DEFAULTS, ...saved?.settings },
 			state: saved?.state ?? emptyState(),
 			stateLink: saved?.stateLink,
+			// Only vaults that synced before can have leftovers; a new install never touches existing folders.
+			tidied: saved?.tidied ?? !(saved?.state && saved.state.cursor > 0),
 		};
 		this.statusEl = this.addStatusBarItem();
 		this.addSettingTab(new SettingsTab(this.app, this));
@@ -87,7 +93,8 @@ export default class SharedKbPlugin extends Plugin {
 			if (!sameKnowledgeBase(this.data.stateLink, link)) this.data.state = emptyState();
 			this.data.stateLink = link;
 		}
-		this.engine = new SyncEngine(new HttpApi(this.base(), obsidianRequest), new VaultFiles(this.app, this.data.settings.folder), this.data.state, () => this.saveData(this.data), {
+		this.files = new VaultFiles(this.app, this.data.settings.folder);
+		this.engine = new SyncEngine(new HttpApi(this.base(), obsidianRequest), this.files, this.data.state, () => this.saveData(this.data), {
 			onConflict: (path, copy) => new Notice(`Shared KB: "${path}" changed on the server while you edited it. Your version is in "${copy}".`, 15000),
 			onDenied: (path) => {
 				if (this.denied.has(path)) return;
@@ -119,10 +126,19 @@ export default class SharedKbPlugin extends Plugin {
 		this.status("syncing…");
 		try {
 			await this.engine.fullSync();
+			await this.tidyOnce();
 			this.status("synced");
 		} catch (e) {
 			this.fail(e, true);
 		}
+	}
+
+	/** Removes empty folders that versions before 0.3.1 left behind after notes moved. Runs once per vault. */
+	private async tidyOnce(): Promise<void> {
+		if (this.data.tidied || !this.files) return;
+		await this.files.removeEmptyFolders();
+		this.data.tidied = true;
+		await this.saveData(this.data);
 	}
 
 	base(): string {
@@ -168,6 +184,7 @@ export default class SharedKbPlugin extends Plugin {
 		for (const t of this.pending.values()) window.clearTimeout(t);
 		this.pending.clear();
 		this.engine = null;
+		this.files = null;
 	}
 
 	/** Live updates: the server sends {type:"changed"} after every write. */
@@ -357,6 +374,22 @@ class VaultFiles implements LocalFiles {
 		}
 	}
 
+	/** Trashes every empty folder inside the sync folder (see tidy.ts). */
+	async removeEmptyFolders(): Promise<void> {
+		const all = this.app.vault.getAllLoadedFiles();
+		const folders = all.filter((f) => f instanceof TFolder).map((f) => f.path);
+		const files = all.filter((f) => f instanceof TFile).map((f) => f.path);
+		for (const dir of emptyFolders(folders, files, this.folder ? normalizePath(this.folder) : "")) {
+			const folder = this.app.vault.getAbstractFileByPath(dir);
+			if (!(folder instanceof TFolder)) continue; // already went with an emptied parent
+			try {
+				await this.app.fileManager.trashFile(folder);
+			} catch (e) {
+				console.warn(`Shared KB: couldn't remove empty folder ${dir}`, e);
+			}
+		}
+	}
+
 	private async ensureFolder(filePath: string): Promise<void> {
 		const dir = filePath.includes("/") ? filePath.slice(0, filePath.lastIndexOf("/")) : "";
 		if (!dir || this.app.vault.getAbstractFileByPath(dir) instanceof TFolder) return;
@@ -383,7 +416,7 @@ class SettingsTab extends PluginSettingTab {
 		const host = s.link ? safeHost(s.link) : "";
 		new Setting(containerEl)
 			.setName("Status")
-			.setDesc(s.link ? `Connected to ${host}${s.who ? ` as ${s.who}` : ""}.` : "Not connected yet. Pair with a code, or paste a link below.");
+			.setDesc(s.link ? `Connected to ${host}${s.who ? ` as ${s.who}` : ""}.` : "Not connected yet. Ask the person who runs your knowledge base for a code, then enter it below.");
 
 		new Setting(containerEl).setName("Pair with a code").setHeading();
 		let server = host;
@@ -423,8 +456,8 @@ class SettingsTab extends PluginSettingTab {
 
 		new Setting(containerEl).setName("Sync").setHeading();
 		new Setting(containerEl)
-			.setName("Member link")
-			.setDesc("Filled in by pairing. Or paste a private link you were given (it ends in /mcp or /). Anyone with it has your access, so keep it private.")
+			.setName("Private link")
+			.setDesc("Filled in when you pair. Or paste a link you were given. Anyone with it can open your notes, so don't share it.")
 			.addText((t) =>
 				t
 					.setPlaceholder("https://…/kb/…/…/")
@@ -437,7 +470,7 @@ class SettingsTab extends PluginSettingTab {
 			);
 		new Setting(containerEl)
 			.setName("Folder")
-			.setDesc("Vault folder to sync the knowledge base into. Leave empty to sync the whole vault.")
+			.setDesc("The vault folder for the shared notes. Leave empty to use the whole vault. If you change it later, the notes are downloaded again into the new folder and the old one is left as it is.")
 			.addText((t) =>
 				t
 					.setPlaceholder("Shared")

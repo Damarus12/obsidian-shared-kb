@@ -9,12 +9,15 @@ import { afterAll, describe, expect, it } from "vitest";
 import { HttpApi, type Requester } from "../src/http-api";
 import { emptyState, SyncEngine, type LocalFiles } from "../src/sync";
 
-const link = process.env.KB_TEST_LINK;
+const address = process.env.KB_TEST_KB;
+const token = process.env.KB_TOKEN;
+const link = address && token ? address.replace(/\/kb\/([^/]+)\/?$/, "/api/$1/") : undefined;
+const auth = { token: async () => token!, refresh: async () => {} };
 const run = Math.random().toString(36).slice(2, 8);
 const dirs: string[] = [];
 
-const fetchRequest: Requester = async ({ url, method, body }) => {
-	const res = await fetch(url, { method, body, headers: { "Content-Type": "application/json" } });
+const fetchRequest: Requester = async ({ url, method, body, headers }) => {
+	const res = await fetch(url, { method, body, headers: { "Content-Type": "application/json", ...headers } });
 	return { status: res.status, json: await res.json().catch(() => null) };
 };
 
@@ -59,7 +62,7 @@ async function vault() {
 	const root = await mkdtemp(join(tmpdir(), "kb-vault-"));
 	dirs.push(root);
 	const files = new DiskFiles(root);
-	const engine = new SyncEngine(new HttpApi(link!, fetchRequest), files, emptyState(), async () => {});
+	const engine = new SyncEngine(new HttpApi(link!, fetchRequest, auth), files, emptyState(), async () => {});
 	return { files, engine };
 }
 

@@ -4,7 +4,7 @@ Two-way sync between an Obsidian vault folder and a **shared-kb** knowledge base
 
 Edit a note in Obsidian and everyone else sees it within seconds. When someone (or their AI) changes a note, it updates in your vault live.
 
-> **You need a shared-kb server and a private link.** The plugin does nothing on its own. The server isn't published yet; if someone invited you, they gave you a link.
+> **You need an account on a shared-kb server.** The plugin does nothing on its own. If someone invited you, open their invite link first and make a passkey; then sign in from the plugin.
 
 ## Install
 
@@ -20,13 +20,15 @@ Edit a note in Obsidian and everyone else sees it within seconds. When someone (
 
 Settings → Shared KB:
 
-- **Pair with a code** (easiest): ask the person who runs the knowledge base for a one-time code (they make it on the server's admin page). In Obsidian, enter the server address (e.g. `kb.example.com`) and the code, then **Pair**. This device gets its own link, which can be removed later on its own.
-  - Or scan their QR code with your phone's camera, tap **Connect** in the browser, then **Open in Obsidian**. Obsidian asks before connecting.
-- **Private link:** or paste a link you were given (ending in `/` or `/mcp`).
-- **Folder:** the vault folder to sync into, or empty for the whole vault. A new, empty vault is simplest.
-- **Connect & sync.** On desktop the status bar shows `KB: synced`.
+1. **Server:** your knowledge base's address, e.g. `kb.example.com`.
+2. **Sign in:** your browser opens. Sign in with your passkey, tap **Allow**, then **Open Obsidian**. (New here? Open the invite link you were sent first, to make your passkey.)
+3. **Knowledge base:** if your account is in more than one, choose which one this vault syncs with.
+4. **Folder:** the vault folder to sync into, or empty for the whole vault. A new, empty vault is simplest.
+5. **Connect & sync.** On desktop the status bar shows `KB: synced`.
 
 Commands: **Sync now**, **Open knowledge base in browser**.
+
+Upgrading from a version before 0.4.0: the private link is gone. The plugin keeps the server and knowledge base from it (and what's already synced); tap **Sign in** once.
 
 ## How it syncs
 
@@ -39,14 +41,14 @@ Commands: **Sync now**, **Open knowledge base in browser**.
 
 ## Network use and privacy
 
-- The plugin talks **only to the server in your private link** (and, when pairing, the server address you type): HTTPS for notes and a WebSocket for change notifications. No telemetry, no other services.
-- An `obsidian://shared-kb?link=…` URL can propose a link; the plugin always asks you to confirm, showing the server, before using it.
+- The plugin talks **only to the server address you entered**: HTTPS for notes, sign-in and tokens, and a WebSocket for change notifications. No telemetry, no other services.
+- Signing in happens in your browser (passkey, then **Allow**). The server sends a one-time code back through an `obsidian://shared-kb-auth` link; the plugin only accepts it for a sign-in it started, and only it can use it (PKCE).
 - Notes in the synced folder are sent to that server and stored there.
-- Your private link is a credential (anyone with it has your access). It's stored in this plugin's `data.json` inside your vault's `.obsidian` folder, so don't share that file or commit it to a public repo.
+- The plugin stores its sign-in (an hour-long access token and a refresh token) in its `data.json` inside your vault's `.obsidian` folder. Anyone with that file can sync as you until you disconnect the app on your account page, so don't share it or commit it to a public repo.
 
 ## Compatibility
 
-Any plugin version works with any server version: newer fields are optional on both sides. Keep it that way (see `CLAUDE.md`).
+0.4.0 needs a server with sign-in (passkeys and OAuth). Older plugin versions only work with older servers.
 
 ## Develop
 
@@ -57,7 +59,7 @@ npm run typecheck
 npm run build       # → dist/main.js
 ```
 
-`test/integration.test.ts` runs two simulated vaults against a real server; it's skipped unless `KB_TEST_LINK` is set to a private link.
+`test/integration.test.ts` runs two simulated vaults against a real server; it's skipped unless `KB_TEST_KB` (a knowledge base address) and `KB_TOKEN` (from the server's `scripts/token.mjs`) are set.
 
 **Release:** `npm version <x.y.z>` (updates `manifest.json` and `versions.json`), then `git push --follow-tags`. The Release workflow builds and attaches `main.js` and `manifest.json`.
 

@@ -1,32 +1,45 @@
-import { App, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, TFile, TFolder, normalizePath, requestUrl } from "obsidian";
-import { HttpApi, type Requester } from "./http-api";
-import { deviceLabel, formatCode, memberLinkFrom, normalizeServer, pairDevice, sameKnowledgeBase } from "./pairing";
+import { App, Notice, Platform, Plugin, PluginSettingTab, Setting, TFile, TFolder, normalizePath, requestUrl } from "obsidian";
+import { finishSignIn, fromLegacyLink, Session, SignedOut, startSignIn, syncKey, type PendingSignIn, type Tokens } from "./auth";
+import { HttpApi, listKnowledgeBases, type Requester } from "./http-api";
+import { deviceLabel, normalizeServer } from "./pairing";
 import { ApiError, emptyState, SyncEngine, type LocalFiles, type SyncState } from "./sync";
 import { emptyFolders } from "./tidy";
 
 interface Settings {
-	/** This device's member link, e.g. https://kb.example.com/kb/abc/token/ */
-	link: string;
+	/** The server, e.g. https://kb.example.com */
+	server: string;
+	/** Which knowledge base on it (its id). */
+	kb: string;
+	/** Its name, for display. */
+	kbName: string;
 	/** Vault folder that mirrors the knowledge base ("" = whole vault). */
 	folder: string;
-	/** Who this link belongs to, e.g. "Alex · iPhone" (display only). */
+	/** Who is signed in, e.g. "Alex" (display only). */
 	who: string;
+	/** Before 0.4.0: a private link. Read once for the server and knowledge base, then removed. */
+	link?: string;
 }
 
 interface Data {
 	settings: Settings;
 	state: SyncState;
-	/** The link the state belongs to; a different link starts a fresh sync. */
+	/** What the sync state belongs to (server + knowledge base); a different one starts a fresh sync. */
+	stateKey?: string;
+	/** Before 0.4.0: the link the state belonged to. */
 	stateLink?: string;
 	/** Empty folders left by versions before 0.3.1 were removed (done once, after a sync). */
 	tidied?: boolean;
+	/** This device's sign-in. Works like a password: anyone with it can sync as you. */
+	auth?: Tokens & { server: string };
+	/** A sign-in started in the browser, waiting for the obsidian://shared-kb-auth link. */
+	pendingSignIn?: PendingSignIn;
 }
 
-const DEFAULTS: Settings = { link: "", folder: "", who: "" };
+const DEFAULTS: Settings = { server: "", kb: "", kbName: "", folder: "", who: "" };
 
 /** requestUrl skips CORS and works on mobile; errors come back as status codes. */
-const obsidianRequest: Requester = async ({ url, method, body }) => {
-	const res = await requestUrl({ url, method, body, contentType: "application/json", throw: false });
+const obsidianRequest: Requester = async ({ url, method, body, contentType, headers }) => {
+	const res = await requestUrl({ url, method, body, contentType: contentType ?? "application/json", headers, throw: false });
 	let json: unknown = null;
 	try {
 		json = res.json;
@@ -41,6 +54,7 @@ const POLL_MS = 5 * 60 * 1000;
 export default class SharedKbPlugin extends Plugin {
 	data: Data = { settings: { ...DEFAULTS }, state: emptyState() };
 	private engine: SyncEngine | null = null;
+	private api: HttpApi | null = null;
 	private files: VaultFiles | null = null;
 	private socket: WebSocket | null = null;
 	private retry = 0;
@@ -49,26 +63,35 @@ export default class SharedKbPlugin extends Plugin {
 	/** Files the server refused this session, so each gets one notice. */
 	private denied = new Set<string>();
 	private statusEl: HTMLElement | null = null;
+	private settingsTab: SettingsTab | null = null;
 
 	async onload(): Promise<void> {
 		const saved = (await this.loadData()) as Partial<Data> | null;
 		this.data = {
 			settings: { ...DEFAULTS, ...saved?.settings },
 			state: saved?.state ?? emptyState(),
+			stateKey: saved?.stateKey,
 			stateLink: saved?.stateLink,
 			// Only vaults that synced before can have leftovers; a new install never touches existing folders.
 			tidied: saved?.tidied ?? !(saved?.state && saved.state.cursor > 0),
+			auth: saved?.auth,
+			pendingSignIn: saved?.pendingSignIn,
 		};
+		await this.fromPrivateLink();
 		this.statusEl = this.addStatusBarItem();
-		this.addSettingTab(new SettingsTab(this.app, this));
+		this.settingsTab = new SettingsTab(this.app, this);
+		this.addSettingTab(this.settingsTab);
 		this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.syncNow() });
 		this.addCommand({
 			id: "open-in-browser",
 			name: "Open knowledge base in browser",
-			callback: () => this.data.settings.link && window.open(this.base()),
+			callback: () => {
+				const { server, kb } = this.data.settings;
+				if (server && kb) window.open(`${server}/kb/${encodeURIComponent(kb)}/`);
+			},
 		});
-		// "Open in Obsidian" on the server's pairing page: obsidian://shared-kb?link=<this device's link>
-		this.registerObsidianProtocolHandler("shared-kb", (params) => this.offerLink(params.link ?? ""));
+		// The server's /oauth/obsidian page sends the browser here after "Allow".
+		this.registerObsidianProtocolHandler("shared-kb-auth", (params) => void this.finishSignIn(params));
 		this.app.workspace.onLayoutReady(() => {
 			this.registerVaultEvents();
 			void this.start();
@@ -83,18 +106,43 @@ export default class SharedKbPlugin extends Plugin {
 		this.stop();
 	}
 
+	/**
+	 * Before 0.4.0 the plugin used a private link. Servers now use sign-in, so keep only the server and
+	 * knowledge base from it (and what's synced, if it's the same one), and forget the link itself.
+	 */
+	private async fromPrivateLink(): Promise<void> {
+		const s = this.data.settings;
+		if (!s.link) return;
+		const old = fromLegacyLink(s.link);
+		if (old && !s.server) Object.assign(s, { server: old.server, kb: old.kb });
+		const was = this.data.stateLink ? fromLegacyLink(this.data.stateLink) : null;
+		if (was && !this.data.stateKey) this.data.stateKey = syncKey(was.server, was.kb);
+		delete s.link;
+		delete this.data.stateLink;
+		s.who = "";
+		await this.saveData(this.data);
+	}
+
 	/** (Re)connects with the current settings. */
 	async start(): Promise<void> {
 		this.stop();
-		const { link } = this.data.settings;
-		if (!link) return this.status("not set up");
-		if (this.data.stateLink !== link) {
-			// A new link for the same knowledge base (e.g. this device's own) keeps what's already synced.
-			if (!sameKnowledgeBase(this.data.stateLink, link)) this.data.state = emptyState();
-			this.data.stateLink = link;
+		const { server, kb } = this.data.settings;
+		const auth = this.data.auth;
+		if (!server) return this.status("not set up");
+		if (!auth || auth.server !== server) return this.status("sign in needed");
+		if (!kb) return this.status("choose a knowledge base");
+		const key = syncKey(server, kb);
+		if (this.data.stateKey !== key) {
+			this.data.state = emptyState();
+			this.data.stateKey = key;
 		}
+		const session = new Session(obsidianRequest, server, auth, async (t) => {
+			this.data.auth = { ...t, server };
+			await this.saveData(this.data);
+		});
+		this.api = new HttpApi(`${server}/api/${encodeURIComponent(kb)}/`, obsidianRequest, session);
 		this.files = new VaultFiles(this.app, this.data.settings.folder);
-		this.engine = new SyncEngine(new HttpApi(this.base(), obsidianRequest), this.files, this.data.state, () => this.saveData(this.data), {
+		this.engine = new SyncEngine(this.api, this.files, this.data.state, () => this.saveData(this.data), {
 			onConflict: (path, copy) => new Notice(`Shared KB: "${path}" changed on the server while you edited it. Your version is in "${copy}".`, 15000),
 			onDenied: (path) => {
 				if (this.denied.has(path)) return;
@@ -108,13 +156,12 @@ export default class SharedKbPlugin extends Plugin {
 		if (!this.data.settings.who) await this.lookupWho();
 	}
 
-	/** Fills in who this link belongs to, for the settings tab. */
+	/** Fills in who is signed in, for the settings tab. */
 	private async lookupWho(): Promise<void> {
 		try {
-			const res = await obsidianRequest({ url: `${this.base()}api/me`, method: "GET" });
-			const me = res.json as { name?: string; device?: string; role?: string } | null;
-			if (res.status !== 200 || !me?.name) return;
-			this.data.settings.who = `${me.name}${me.device ? ` · ${me.device}` : ""}${me.role === "read" ? " (read-only)" : ""}`;
+			const me = await this.api?.me();
+			if (!me?.name) return;
+			this.data.settings.who = `${me.name}${me.role === "read" ? " (read-only)" : ""}`;
 			await this.saveData(this.data);
 		} catch {
 			// Offline; try again next start.
@@ -141,39 +188,58 @@ export default class SharedKbPlugin extends Plugin {
 		await this.saveData(this.data);
 	}
 
-	base(): string {
-		return this.data.settings.link.trim().replace(/\/(mcp)?\/?$/, "") + "/";
-	}
-
-	/** Trades a one-time code from the server's Devices page for this device's own link, then syncs. */
-	async pair(server: string, code: string): Promise<void> {
-		const paired = await pairDevice(obsidianRequest, server, code, deviceLabel(Platform));
-		await this.useLink(paired.link, `${paired.name}${paired.device ? ` · ${paired.device}` : ""}${paired.role === "read" ? " (read-only)" : ""}`);
-		new Notice(`Shared KB: connected as ${this.data.settings.who}.`);
-	}
-
-	async useLink(link: string, who: string): Promise<void> {
-		this.data.settings.link = link;
-		this.data.settings.who = who;
+	/** Opens the server's sign-in page in the browser; it comes back through obsidian://shared-kb-auth. */
+	async signIn(serverInput: string): Promise<void> {
+		const server = normalizeServer(serverInput);
+		const known = this.data.auth?.server === server ? this.data.auth.clientId : this.data.pendingSignIn?.server === server ? this.data.pendingSignIn.clientId : undefined;
+		const { url, pending } = await startSignIn(obsidianRequest, server, known, deviceLabel(Platform));
+		if (this.data.settings.server !== server) Object.assign(this.data.settings, { server, kb: "", kbName: "", who: "" });
+		this.data.pendingSignIn = pending;
 		await this.saveData(this.data);
-		await this.start();
+		window.open(url);
 	}
 
-	/** A link that arrived by obsidian:// URL. Any web page can open one, so the person confirms first. */
-	private offerLink(raw: string): void {
-		const link = memberLinkFrom(raw);
-		if (!link) {
-			new Notice("Shared KB: that wasn't a valid link.");
-			return;
+	private async finishSignIn(params: Record<string, string>): Promise<void> {
+		const pending = this.data.pendingSignIn;
+		try {
+			if (!pending) throw new Error("No sign-in is waiting. Start it from the plugin's settings.");
+			const tokens = await finishSignIn(obsidianRequest, pending, params, Date.now());
+			this.data.auth = { ...tokens, server: pending.server };
+			delete this.data.pendingSignIn;
+			await this.saveData(this.data);
+			// Pick the knowledge base: the one already chosen if it's still there, else the only one.
+			const session = new Session(obsidianRequest, pending.server, tokens, async () => {});
+			const { name, kbs } = await listKnowledgeBases(obsidianRequest, pending.server, session);
+			const s = this.data.settings;
+			const chosen = kbs.find((k) => k.id === s.kb) ?? (kbs.length === 1 ? kbs[0] : undefined);
+			Object.assign(s, { kb: chosen?.id ?? "", kbName: chosen?.name ?? "", who: name });
+			await this.saveData(this.data);
+			new Notice(chosen ? `Shared KB: signed in as ${name}. Syncing "${chosen.name}".` : `Shared KB: signed in as ${name}. Choose a knowledge base in the plugin's settings.`);
+			this.settingsTab?.display();
+			await this.start();
+		} catch (e) {
+			new Notice(`Shared KB: ${e instanceof Error ? e.message : String(e)}`, 15000);
 		}
-		const { folder } = this.data.settings;
-		new ConfirmModal(
-			this.app,
-			"Connect to a knowledge base?",
-			`Notes in ${folder ? `the "${folder}" folder` : "this whole vault"} will sync with ${new URL(link).host}. Only continue if you just tapped "Open in Obsidian" on your own device.`,
-			"Connect",
-			() => void this.useLink(link, "").then(() => new Notice(`Shared KB: connected to ${new URL(link).host}.`)),
-		).open();
+	}
+
+	/** Forgets this device's sign-in. (To disconnect it on the server too: your account page there.) */
+	async signOut(): Promise<void> {
+		this.stop();
+		delete this.data.auth;
+		this.data.settings.who = "";
+		await this.saveData(this.data);
+		this.status("signed out");
+	}
+
+	/** The knowledge bases this sign-in can sync, for the settings tab. */
+	async knowledgeBases(): Promise<Array<{ id: string; name: string }>> {
+		const auth = this.data.auth;
+		if (!auth) return [];
+		const session = new Session(obsidianRequest, auth.server, auth, async (t) => {
+			this.data.auth = { ...t, server: auth.server };
+			await this.saveData(this.data);
+		});
+		return (await listKnowledgeBases(obsidianRequest, auth.server, session)).kbs;
 	}
 
 	private stop(): void {
@@ -184,43 +250,59 @@ export default class SharedKbPlugin extends Plugin {
 		for (const t of this.pending.values()) window.clearTimeout(t);
 		this.pending.clear();
 		this.engine = null;
+		this.api = null;
 		this.files = null;
 	}
 
-	/** Live updates: the server sends {type:"changed"} after every write. */
+	/** Live updates: the server sends {type:"changed"} after every write. Each connection needs a fresh one-minute ticket. */
 	private connect(): void {
 		const engine = this.engine;
-		if (!engine) return;
-		const ws = new WebSocket(this.base().replace(/^http/, "ws") + "ws");
-		this.socket = ws;
-		let ping: number | null = null;
-		ws.onopen = () => {
-			this.retry = 0;
-			ping = window.setInterval(() => ws.readyState === WebSocket.OPEN && ws.send("ping"), 30000);
-		};
-		ws.onmessage = (e) => {
-			let msg: { type?: string; seq?: number };
-			try {
-				msg = JSON.parse(String(e.data)) as typeof msg;
-			} catch {
-				return; // "pong", or anything else that isn't an event
-			}
-			if ((msg.type === "changed" || msg.type === "hello") && (msg.seq ?? 0) > engine.state.cursor) {
-				this.track(engine.pull());
-			}
-			// This link's access changed: the pull sees a new scope and syncs the folders again.
-			if (msg.type === "access") {
-				this.denied.clear();
-				this.track(engine.pull());
-			}
-		};
-		ws.onclose = () => {
-			if (ping !== null) window.clearInterval(ping);
-			if (this.socket !== ws || this.engine !== engine) return; // replaced or stopped
+		const api = this.api;
+		const { server, kb } = this.data.settings;
+		if (!engine || !api) return;
+		const retry = () => {
+			if (this.engine !== engine) return; // replaced or stopped
 			this.status("offline, retrying");
 			const delay = Math.min(60000, 1000 * 2 ** this.retry++);
 			this.retryTimer = window.setTimeout(() => this.connect(), delay);
 		};
+		api.wsTicket().then(
+			({ ticket }) => {
+				if (this.engine !== engine) return;
+				const ws = new WebSocket(`${server.replace(/^http/, "ws")}/ws/${encodeURIComponent(kb)}?ticket=${encodeURIComponent(ticket)}`);
+				this.socket = ws;
+				let ping: number | null = null;
+				ws.onopen = () => {
+					this.retry = 0;
+					ping = window.setInterval(() => ws.readyState === WebSocket.OPEN && ws.send("ping"), 30000);
+				};
+				ws.onmessage = (e) => {
+					let msg: { type?: string; seq?: number };
+					try {
+						msg = JSON.parse(String(e.data)) as typeof msg;
+					} catch {
+						return; // "pong", or anything else that isn't an event
+					}
+					if ((msg.type === "changed" || msg.type === "hello") && (msg.seq ?? 0) > engine.state.cursor) {
+						this.track(engine.pull());
+					}
+					// Access changed: the pull sees a new scope and syncs the folders again.
+					if (msg.type === "access") {
+						this.denied.clear();
+						this.track(engine.pull());
+					}
+				};
+				ws.onclose = () => {
+					if (ping !== null) window.clearInterval(ping);
+					if (this.socket !== ws) return;
+					retry();
+				};
+			},
+			(e) => {
+				if (e instanceof SignedOut) return this.fail(e, true);
+				retry();
+			},
+		);
 	}
 
 	private registerVaultEvents(): void {
@@ -283,12 +365,18 @@ export default class SharedKbPlugin extends Plugin {
 	/** Background errors only show in the status bar; a failed full sync (startup, "Sync now") also gets a notice. */
 	private fail(e: unknown, notify = false): void {
 		console.error("Shared KB", e);
+		if (e instanceof SignedOut) {
+			this.stop();
+			this.status("sign in needed");
+			if (notify) new Notice(`Shared KB: ${e.message}`, 15000);
+			return;
+		}
 		this.status("error");
 		if (!notify) return;
-		const badLink = e instanceof ApiError && [401, 403, 404].includes(e.status);
-		const msg = badLink
-			? "This link isn't valid (it may be incomplete, or was revoked). Copy it again, or ask for a new one."
-			: `Sync failed: ${e instanceof Error ? e.message : String(e)}`;
+		const msg =
+			e instanceof ApiError && e.status === 404
+				? "That knowledge base isn't on your account (any more). Choose another in the plugin's settings."
+				: `Sync failed: ${e instanceof Error ? e.message : String(e)}`;
 		new Notice(`Shared KB: ${msg}`, 15000);
 	}
 }
@@ -412,62 +500,77 @@ class SettingsTab extends PluginSettingTab {
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
-		const s = this.plugin.data.settings;
-		const host = s.link ? safeHost(s.link) : "";
+		const data = this.plugin.data;
+		const s = data.settings;
+		const signedIn = !!data.auth && data.auth.server === s.server;
+		const host = s.server ? safeHost(s.server) : "";
 		new Setting(containerEl)
 			.setName("Status")
-			.setDesc(s.link ? `Connected to ${host}${s.who ? ` as ${s.who}` : ""}.` : "Not connected yet. Ask the person who runs your knowledge base for a code, then enter it below.");
+			.setDesc(
+				!s.server
+					? "Not connected yet. Enter your knowledge base's server address and sign in."
+					: !signedIn
+						? `Sign in to ${host} to sync.`
+						: s.kb
+							? `Syncing "${s.kbName || s.kb}" on ${host}${s.who ? ` as ${s.who}` : ""}.`
+							: `Signed in to ${host}. Choose a knowledge base below.`,
+			);
 
-		new Setting(containerEl).setName("Pair with a code").setHeading();
-		let server = host;
-		let code = "";
+		new Setting(containerEl).setName("Sign in").setHeading();
+		let server = s.server ? host : "";
 		new Setting(containerEl)
 			.setName("Server")
-			.setDesc("The knowledge base's address.")
+			.setDesc("Your knowledge base's address, e.g. kb.example.com.")
 			.addText((t) => t.setPlaceholder("kb.example.com").setValue(server).onChange((v) => (server = v)));
 		new Setting(containerEl)
-			.setName("Code")
-			.setDesc("A one-time code from the person who runs the knowledge base. It works once, for 10 minutes.")
-			.addText((t) => {
-				t.inputEl.autocapitalize = "characters";
-				t.inputEl.spellcheck = false;
-				t.setPlaceholder("XXXX-XXXX").onChange((v) => {
-					code = formatCode(v);
-					if (code !== v) t.setValue(code);
-				});
-			})
+			.setName(signedIn ? "Signed in" : "Sign in with your passkey")
+			.setDesc(
+				signedIn
+					? "To stop this device syncing, sign out here. To disconnect it on the server too, use your account page there."
+					: "Opens your browser: sign in with your passkey and tap Allow, then come back to Obsidian. New here? Open the invite link you were sent first.",
+			)
 			.addButton((b) =>
 				b
-					.setButtonText("Pair")
+					.setButtonText(signedIn ? "Sign in again" : "Sign in")
 					.setCta()
 					.onClick(async () => {
-						b.setDisabled(true);
 						try {
-							normalizeServer(server);
-							await this.plugin.pair(server, code);
-							this.display();
+							await this.plugin.signIn(server);
 						} catch (e) {
 							new Notice(`Shared KB: ${e instanceof Error ? e.message : String(e)}`, 10000);
-						} finally {
-							b.setDisabled(false);
 						}
+					}),
+			)
+			.addButton((b) =>
+				b
+					.setButtonText("Sign out")
+					.setDisabled(!signedIn)
+					.onClick(async () => {
+						await this.plugin.signOut();
+						this.display();
 					}),
 			);
 
 		new Setting(containerEl).setName("Sync").setHeading();
-		new Setting(containerEl)
-			.setName("Private link")
-			.setDesc("Filled in when you pair. Or paste a link you were given. Anyone with it can open your notes, so don't share it.")
-			.addText((t) =>
-				t
-					.setPlaceholder("https://…/kb/…/…/")
-					.setValue(s.link)
-					.onChange(async (v) => {
-						s.link = v.trim();
-						s.who = "";
-						await this.plugin.saveData(this.plugin.data);
-					}),
+		const kbSetting = new Setting(containerEl).setName("Knowledge base").setDesc(signedIn ? "Loading…" : "Sign in first.");
+		if (signedIn) {
+			void this.plugin.knowledgeBases().then(
+				(kbs) => {
+					kbSetting.setDesc(kbs.length ? "Which knowledge base this vault syncs with." : "Your account isn't in any knowledge base yet. Ask for an invite.");
+					if (!kbs.length) return;
+					kbSetting.addDropdown((d) => {
+						if (!kbs.some((k) => k.id === s.kb)) d.addOption("", "Choose…");
+						for (const k of kbs) d.addOption(k.id, k.name);
+						d.setValue(s.kb).onChange(async (id) => {
+							const k = kbs.find((x) => x.id === id);
+							Object.assign(s, { kb: k?.id ?? "", kbName: k?.name ?? "" });
+							await this.plugin.saveData(this.plugin.data);
+						});
+					});
+				},
+				(e) => kbSetting.setDesc(`Couldn't load your knowledge bases: ${e instanceof Error ? e.message : String(e)}`),
 			);
+		}
 		new Setting(containerEl)
 			.setName("Folder")
 			.setDesc("The vault folder for the shared notes. Leave empty to use the whole vault. If you change it later, the notes are downloaded again into the new folder and the old one is left as it is.")
@@ -477,7 +580,7 @@ class SettingsTab extends PluginSettingTab {
 					.setValue(s.folder)
 					.onChange(async (v) => {
 						s.folder = v.trim().replace(/^\/+|\/+$/g, "");
-						this.plugin.data.stateLink = undefined; // a new folder needs a fresh first sync
+						this.plugin.data.stateKey = undefined; // a new folder needs a fresh first sync
 						await this.plugin.saveData(this.plugin.data);
 					}),
 			);
@@ -498,37 +601,5 @@ function safeHost(link: string): string {
 		return new URL(link).host;
 	} catch {
 		return "";
-	}
-}
-
-class ConfirmModal extends Modal {
-	constructor(
-		app: App,
-		private readonly heading: string,
-		private readonly message: string,
-		private readonly confirmText: string,
-		private readonly onConfirm: () => void,
-	) {
-		super(app);
-	}
-
-	onOpen(): void {
-		this.titleEl.setText(this.heading);
-		this.contentEl.createEl("p", { text: this.message });
-		new Setting(this.contentEl)
-			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()))
-			.addButton((b) =>
-				b
-					.setButtonText(this.confirmText)
-					.setCta()
-					.onClick(() => {
-						this.close();
-						this.onConfirm();
-					}),
-			);
-	}
-
-	onClose(): void {
-		this.contentEl.empty();
 	}
 }

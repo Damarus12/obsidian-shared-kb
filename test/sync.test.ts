@@ -69,6 +69,8 @@ class FakeServer implements Api {
 
 class FakeFiles implements LocalFiles {
 	files = new Map<string, string>();
+	/** Renames made through this adapter: Obsidian reports each one back as a rename event. */
+	renamed: [string, string][] = [];
 	list() {
 		return [...this.files.keys()];
 	}
@@ -89,6 +91,7 @@ class FakeFiles implements LocalFiles {
 	async rename(a: string, b: string) {
 		this.files.set(b, await this.read(a));
 		this.files.delete(a);
+		this.renamed.push([a, b]);
 	}
 }
 
@@ -178,6 +181,28 @@ describe("SyncEngine", () => {
 		await engine.fileChanged("a.md");
 		expect(files.files.get("a.md")).toBe("theirs");
 		expect(files.files.get(conflicts[0])).toBe("mine");
+	});
+
+	it("adopts a local file that already matches the remote note, without a conflict copy", async () => {
+		await server.external("a.md", "same");
+		files.files.set("a.md", "same");
+		await engine.fullSync();
+		expect(conflicts).toEqual([]);
+		expect([...files.files.keys()]).toEqual(["a.md"]);
+		expect(server.live("a.md")?.version).toBe(1);
+		await engine.fileChanged("a.md"); // the next edit goes up as a normal update
+		expect(server.notes.size).toBe(1);
+	});
+
+	it("keeps its own conflict copies local when Obsidian reports them as renames", async () => {
+		await server.external("a.md", "theirs");
+		files.files.set("a.md", "mine");
+		await engine.fullSync();
+		for (const [from, to] of files.renamed) await engine.fileRenamed(from, to);
+		await engine.fileChanged("a.md");
+		expect(files.files.get(conflicts[0])).toBe("mine");
+		expect(files.files.get("a.md")).toBe("theirs");
+		expect([...server.notes.values()].map((n) => [n.path, n.version])).toEqual([["a.md", 1]]);
 	});
 
 	it("follows remote deletes, but keeps a locally edited file", async () => {

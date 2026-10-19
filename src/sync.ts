@@ -174,6 +174,8 @@ export class SyncEngine {
 
 	fileRenamed(from: string, to: string): Promise<void> {
 		return this.serial(async () => {
+			// Conflict copies stay local, including the ones this engine makes by renaming a file aside.
+			if (isConflictCopy(to)) return;
 			const found = this.byPath(from);
 			if (!found) {
 				if (!isConflictCopy(to) && this.files.exists(to)) await this.pushNow(to);
@@ -252,7 +254,7 @@ export class SyncEngine {
 			await this.files.rename(current, target);
 			current = target;
 		}
-		if (!entry) await this.moveAside(target, change.id);
+		if (!entry) await this.moveAside(target, change.id, content);
 
 		const localExists = this.files.exists(target);
 		const local = localExists ? await this.files.read(target) : null;
@@ -267,11 +269,15 @@ export class SyncEngine {
 		if (local !== content) await this.files.write(target, content);
 	}
 
-	/** If an unmapped local file sits where a remote note must go, keep it as a conflict copy. */
-	private async moveAside(path: string, incomingId: string): Promise<void> {
+	/**
+	 * If an unmapped local file sits where a remote note must go, keep it as a conflict copy,
+	 * unless it already has the note's text (e.g. a vault synced before): then it simply is that note.
+	 */
+	private async moveAside(path: string, incomingId: string, incoming?: string): Promise<void> {
 		if (!this.files.exists(path)) return;
 		const owner = this.byPath(path);
 		if (owner && owner[0] === incomingId) return;
+		if (!owner && incoming !== undefined && (await this.files.read(path)) === incoming) return;
 		if (owner) {
 			// Another synced note claims this path; the feed will move or delete it next.
 			delete this.state.notes[owner[0]];
